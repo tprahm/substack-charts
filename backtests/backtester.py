@@ -21,12 +21,13 @@ class RobustOptionBacktester:
         trade_side="sell",
         monthly_expiration=True,
         contract_size=1,
-        opening_fee=0.75,  # Flat fee for opening a trade
-        closing_fee=0.75,  # Flat fee for closing a trade
+        opening_fee=0.75,
+        closing_fee=0.75,
         exclude_decimal_strikes=False,
         custom_columns=None,
         output_csv=None,
         daily_pnl_output_csv=None,
+        closed_positions_output_csv=None,
     ):
         self.data_directory = data_directory
         self.start_date = pd.to_datetime(start_date) if start_date else None
@@ -36,12 +37,13 @@ class RobustOptionBacktester:
         self.trade_side = trade_side.lower()
         self.monthly_expiration = monthly_expiration
         self.contract_size = contract_size
-        self.opening_fee = opening_fee  # Dynamic fee
-        self.closing_fee = closing_fee  # Dynamic fee
+        self.opening_fee = opening_fee
+        self.closing_fee = closing_fee
         self.exclude_decimal_strikes = exclude_decimal_strikes
 
         self.output_csv = output_csv
         self.daily_pnl_output_csv = daily_pnl_output_csv
+        self.closed_positions_output_csv = closed_positions_output_csv
 
         default_columns = {
             "date_col": "c_date",
@@ -125,7 +127,6 @@ class RobustOptionBacktester:
     def open_new_position(self, row):
         """Store the open position details."""
         open_price = self.get_open_price(row)
-
         pos_type = "ask" if self.trade_side == "buy" else "bid"
 
         self.open_position = {
@@ -140,10 +141,8 @@ class RobustOptionBacktester:
             "pos_type": pos_type,
             "pos_value": float(open_price),
             "quantity": self.contract_size,
-            "spot_on_open": row[self.columns["underlying_price_col"]],
         }
 
-        # Log daily record for the newly opened position
         self._log_daily_pnl(row, status="open")
 
     def close_position(self, row):
@@ -158,15 +157,13 @@ class RobustOptionBacktester:
             else (close_price - self.open_position["pos_value"]) * self.contract_size
         )
 
-        # Net PnL includes total fees incurred
-        total_fees_incurred = .15  # $0.075 open + $0.075 close
+        total_fees_incurred = 1.50
 
-        # Log final daily record with status="close"
         self._log_daily_pnl(row, status="close", fees_incurred=total_fees_incurred)
         self.open_position = None
 
     def _log_daily_pnl(self, row, status="hold", fees_incurred=0.0):
-        """Log daily PnL for the position."""
+        """Log daily PnL for the position, including fees incurred and precise percentages."""
         if not self.open_position:
             return
 
@@ -187,24 +184,29 @@ class RobustOptionBacktester:
         elif status == "open":
             pos_price = self.get_open_price(row)
             pos_type = "ask" if self.trade_side == "buy" else "bid"
-            fees_incurred = self.opening_fee  # Dynamic opening fee
+            fees_incurred = self.opening_fee
         elif status == "close":
             pos_price = self.get_close_price(row)
             pos_type = "mid"
-            fees_incurred = self.opening_fee + self.closing_fee  # Total fees for open + close
+            fees_incurred = self.opening_fee + self.closing_fee
         else:
             pos_price = self.get_mid_price(row)
             pos_type = "mid"
+            fees_incurred = 0.0
 
-        # Adjusted raw PnL calculation to represent dollar amounts directly
+        cumulative_fees = self.opening_fee
+        if status == "close":
+            cumulative_fees += self.closing_fee
+
         if self.trade_side == "buy":
-            daily_raw_pnl = (pos_price - self.open_position["pos_value"]) * 100
+            total_raw_pnl = (pos_price - self.open_position["pos_value"]) * 100
         else:
-            daily_raw_pnl = (self.open_position["pos_value"] - pos_price) * 100
+            total_raw_pnl = (self.open_position["pos_value"] - pos_price) * 100
 
-        daily_raw_pnl -= fees_incurred
+        total_raw_pnl -= cumulative_fees
         original_pnl = self.open_position["pos_value"] * 100
-        daily_pct_pnl = (daily_raw_pnl / original_pnl) * 100 if original_pnl != 0 else np.nan
+
+        total_pct_pnl = (total_raw_pnl / original_pnl) if original_pnl != 0 else np.nan
 
         daily_record = {
             "date": row[self.columns["date_col"]],
@@ -214,46 +216,38 @@ class RobustOptionBacktester:
             "expiration": self.open_position["expiration"],
             "strike": self.open_position["strike"],
             "underlying_price": row.get(self.columns["underlying_price_col"], np.nan),
-            "spot_on_open": self.open_position["spot_on_open"],
             "pos_type": pos_type,
             "pos_price": pos_price,
-            "original_open_price": self.open_position["pos_value"],
             "quantity": self.open_position["quantity"],
             "openinterest": row.get(self.columns["openinterest_col"], np.nan),
             "iv": row.get(self.columns["iv_col"], np.nan),
-            "daily_raw_pnl": round(daily_raw_pnl, 8),
-            "daily_pct_pnl": round(daily_pct_pnl, 2),
-            "fees_incurred": fees_incurred,
+            "total_raw_pnl": round(total_raw_pnl, 8),
+            "total_pct_pnl": round(total_pct_pnl, 4),
         }
 
         self.daily_pnl_log.append(daily_record)
-
+        
     # --------------------- Contract Selection --------------------- #
 
     def pick_contract(self, df_for_day):
         """Pick the option contract based on nearest expiration and closest-to-ATM."""
         sub = df_for_day[df_for_day[self.columns["call_put_col"]] == self.call_or_put]
 
-        # Filter for monthly expiration (if applicable)
         if self.monthly_expiration:
             sub = sub[sub[self.columns["expiration_col"]].apply(self._is_third_friday)]
         if sub.empty:
             return None
 
-        # Exclude strikes with decimals if the parameter is set
         if self.exclude_decimal_strikes:
             sub = sub[sub[self.columns["strike_col"]] == sub[self.columns["strike_col"]].round()]
         if sub.empty:
             return None
 
-        # Prioritize nearest expiration date
         sub["days_to_expiration"] = (sub[self.columns["expiration_col"]] - sub[self.columns["date_col"]]).dt.days
         nearest_expiration = sub.loc[sub["days_to_expiration"].idxmin(), self.columns["expiration_col"]]
 
-        # Filter for that nearest expiration date only
         sub = sub[sub[self.columns["expiration_col"]] == nearest_expiration]
 
-        # Select closest to ATM among nearest expiration contracts
         return sub.loc[sub[self.columns["otm_col"]].abs().idxmin()]
 
     # --------------------- Main Backtest Loop --------------------- #
@@ -280,7 +274,6 @@ class RobustOptionBacktester:
 
                 monday_after_expiration = previous_expiration_date + pd.Timedelta(days=(7 - previous_expiration_date.weekday()))
                 if current_date.date() < monday_after_expiration:
-                    # If there's an open position, we still log the daily PnL
                     if self.open_position:
                         matching = daily_df[daily_df[self.columns["option_symbol_col"]] == self.open_position["symbol"]]
                         if not matching.empty:
@@ -293,26 +286,19 @@ class RobustOptionBacktester:
                     self.close_position(row_close)
                     continue
 
-                # Open position logic
                 if self.open_position is None and day_name == self.day_of_entry:
                     candidate = self.pick_contract(daily_df)
                     if candidate is not None:
                         self.open_new_position(candidate)
                 else:
-                    # If still holding a position, log daily PnL
                     if self.open_position:
                         matching = daily_df[daily_df[self.columns["option_symbol_col"]] == self.open_position["symbol"]]
                         if not matching.empty:
                             self._log_daily_pnl(matching.iloc[0], status="hold")
 
-        # Removed final_trades_df = pd.DataFrame(self.trades_log)
-
-        # Convert daily PnL log to a DataFrame
         final_daily_df = pd.DataFrame(self.daily_pnl_log)
 
-        # Removed saving of trade-level log to CSV
-
-        # Save daily PnL log to CSV
+        # Save the daily PnL log
         if self.daily_pnl_output_csv:
             try:
                 final_daily_df.to_csv(self.daily_pnl_output_csv, index=False)
@@ -320,7 +306,15 @@ class RobustOptionBacktester:
             except Exception as e:
                 print(f"Error saving daily PnL log to CSV: {e}")
 
-        # Return only the daily PnL DataFrame
+        # Filter and save closed positions log
+        if self.closed_positions_output_csv:
+            closed_positions = final_daily_df[final_daily_df["status"] == "close"]
+            try:
+                closed_positions.to_csv(self.closed_positions_output_csv, index=False)
+                print(f"Closed positions log saved successfully to: {self.closed_positions_output_csv}")
+            except Exception as e:
+                print(f"Error saving closed positions log to CSV: {e}")
+
         return final_daily_df
 
 
@@ -330,15 +324,12 @@ if __name__ == "__main__":
     backtester = RobustOptionBacktester(
         data_directory=f"historical/{symbol}/",
         start_date="2014-01-01",
-        end_date="2024-03-31",
-        call_or_put="C",
-        trade_side="buy",
+        end_date="2024-12-31",
+        call_or_put="P",
+        trade_side="sell",
         monthly_expiration=True,
         exclude_decimal_strikes=True,
-        # Removed trade log output CSV
-        daily_pnl_output_csv=f"trade_logs/{symbol}_daily_pnl_log.csv",  # Only daily PnL output
+        daily_pnl_output_csv=f"trade_logs/{symbol}_daily_pnl_log.csv",
+        closed_positions_output_csv=f"trade_logs/{symbol}_closed_positions_log.csv",
     )
     daily_df = backtester.run_backtest()
-
-    print("\n----- Daily PnL Log -----")
-    print(daily_df.head())
