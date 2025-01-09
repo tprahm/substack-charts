@@ -7,9 +7,10 @@ class RobustOptionBacktester:
     """
     An extensive backtester that:
       - Iterates EOD option data from CSV(s) in a directory
-      - Filters by user-specified day to enter, monthly expiry, delta, etc.
-      - Opens/closes positions, calculates PnL including fees
-      - Produces only a day-by-day PnL log (trade log references removed).
+      - Can open multiple positions in one day (e.g. sell put + sell call)
+      - Calculates day-by-day PnL for each open position
+      - Produces a day-by-day PnL log where each row can represent one position
+        on a given date (i.e. potentially multiple rows per date).
     """
     def __init__(
         self,
@@ -17,8 +18,6 @@ class RobustOptionBacktester:
         start_date=None,
         end_date=None,
         day_of_entry="Monday",
-        call_or_put="C",
-        trade_side="sell",
         monthly_expiration=True,
         contract_size=1,
         opening_fee=0.75,
@@ -33,8 +32,6 @@ class RobustOptionBacktester:
         self.start_date = pd.to_datetime(start_date) if start_date else None
         self.end_date = pd.to_datetime(end_date) if end_date else None
         self.day_of_entry = day_of_entry
-        self.call_or_put = call_or_put.upper()
-        self.trade_side = trade_side.lower()
         self.monthly_expiration = monthly_expiration
         self.contract_size = contract_size
         self.opening_fee = opening_fee
@@ -62,12 +59,17 @@ class RobustOptionBacktester:
         }
 
         self.columns = {**default_columns, **(custom_columns or {})}
-        self.open_position = None
+        
+        # Instead of a single open_position, we maintain a list of open positions
+        self.open_positions = []
+        
+        # Our daily log can now have multiple rows for a single date (one row per position)
         self.daily_pnl_log = []
 
-
-    # --------------------- File Handling --------------------- #
-
+    # ----------------------------------------------------------
+    # File Handling
+    # ----------------------------------------------------------
+    
     def _list_csv_files(self):
         """Return a list of CSV paths from either a directory or single file."""
         if os.path.isfile(self.data_directory):
@@ -99,21 +101,39 @@ class RobustOptionBacktester:
         return df
 
     def _is_third_friday(self, dt):
-        """Default check for monthly expiration: 3rd Friday of the month."""
-        return (dt.weekday() == 4) and (15 <= dt.day <= 21)
+        """
+        Identify the third Friday of the month, including cases where expiration is stored as the Saturday after the third Friday.
+        """
+        # If the date is a Friday in the 15th-21st range
+        if (dt.weekday() == 4) and (15 <= dt.day <= 21):
+            return True
+        
+        # If the date is a Saturday, check if the previous day is a valid third Friday
+        if (dt.weekday() == 5) and (15 <= (dt - pd.Timedelta(days=1)).day <= 21):
+            return True
 
-    # --------------------- Entry/Exit Prices --------------------- #
+        return False
 
-    def get_open_price(self, row):
-        """Determine the open price based on trade side."""
-        if self.trade_side == "buy":
+    # ----------------------------------------------------------
+    # Price Helpers
+    # ----------------------------------------------------------
+    
+    def get_open_price(self, row, trade_side):
+        """
+        If we're buying, we open at the Ask.
+        If we're selling, we open at the Bid.
+        """
+        if trade_side.lower() == "buy":
             return row[self.columns["ask_col"]]
         else:
             return row[self.columns["bid_col"]]
 
-    def get_close_price(self, row):
-        """Determine the close price based on trade side."""
-        if self.open_position and self.open_position["trade_side"] == "buy":
+    def get_close_price(self, row, trade_side):
+        """
+        If we originally bought (trade_side=buy), we'd close by selling at the Bid.
+        If we originally sold (trade_side=sell), we'd close by buying at the Ask.
+        """
+        if trade_side.lower() == "buy":
             return row[self.columns["bid_col"]]
         else:
             return row[self.columns["ask_col"]]
@@ -122,141 +142,206 @@ class RobustOptionBacktester:
         """Compute the midpoint price from bid/ask."""
         return 0.5 * (row[self.columns["ask_col"]] + row[self.columns["bid_col"]])
 
-    # --------------------- Position Management --------------------- #
+    # ----------------------------------------------------------
+    # Position Management
+    # ----------------------------------------------------------
+    
+    def open_new_position(self, row, trade_side):
+        """
+        Create a single new open-position dict for tracking.
+        e.g. if user wants to short a Put, trade_side="sell", call_put="P".
+        """
+        open_price = self.get_open_price(row, trade_side)
 
-    def open_new_position(self, row):
-        """Store the open position details."""
-        open_price = self.get_open_price(row)
-        pos_type = "ask" if self.trade_side == "buy" else "bid"
-
-        self.open_position = {
+        new_pos = {
             "symbol": row[self.columns["option_symbol_col"]],
             "open_datetime": row[self.columns["date_col"]],
             "expiration": row[self.columns["expiration_col"]],
-            "call_put": row[self.columns["call_put_col"]],
+            "call_put": row[self.columns["call_put_col"]],  # 'C' or 'P'
             "strike": row[self.columns["strike_col"]],
             "openinterest": row.get(self.columns["openinterest_col"], np.nan),
             "iv": row.get(self.columns["iv_col"], np.nan),
-            "trade_side": self.trade_side,
-            "pos_type": pos_type,
+            "trade_side": trade_side.lower(),              # 'buy' or 'sell'
             "pos_value": float(open_price),
             "quantity": self.contract_size,
+            "fees_incurred": self.opening_fee,             # Track opening fees
+            "underlying_price_at_expiration": None,         # Placeholder for expiration price
         }
 
-        self._log_daily_pnl(row, status="open")
+        self.open_positions.append(new_pos)
+        
+        # Log an 'open' record to daily PnL
+        self._log_daily_pnl(position=new_pos, row=row, status="open")
 
-    def close_position(self, row):
-        """Close the open position and calculate PnL."""
-        if not self.open_position:
-            return
+    def open_multiple_positions(self, rows_and_sides):
+        """
+        If you want to open multiple legs simultaneously (e.g. short call + short put),
+        you can pass a list of (row, trade_side) pairs here.
+        
+        Example usage:
+          self.open_multiple_positions([
+              (row_for_call, "sell"),
+              (row_for_put,  "sell")
+          ])
+        """
+        for (row, side) in rows_and_sides:
+            self.open_new_position(row, side)
 
-        close_price = self.get_close_price(row)
-        raw_pnl = (
-            (self.open_position["pos_value"] - close_price) * self.contract_size
-            if self.trade_side == "sell"
-            else (close_price - self.open_position["pos_value"]) * self.contract_size
-        )
+    def close_position(self, position, row_close):
+        """
+        Close a single given open position.
+        On expiration day or the adjusted expiration (Friday before),
+        calculate intrinsic value instead of using market price.
+        """
+        current_date = row_close[self.columns["date_col"]].date()
+        expiration_date = position["expiration"].date()
+        day_before_expiration = expiration_date - pd.Timedelta(days=1)
+        
+        # Check if the day is the day before expiration and a Friday
+        is_adjusted_expiration = current_date == day_before_expiration and day_before_expiration.weekday() == 4
 
-        total_fees_incurred = 1.50
+        if current_date >= expiration_date or is_adjusted_expiration:
+            # Calculate intrinsic value at expiration
+            if position["call_put"] == "C":  # Call option
+                intrinsic_value = max(0, row_close[self.columns["underlying_price_col"]] - position["strike"])
+            elif position["call_put"] == "P":  # Put option
+                intrinsic_value = max(0, position["strike"] - row_close[self.columns["underlying_price_col"]])
+            else:
+                intrinsic_value = 0  # Invalid option type, default to 0
+            close_price = intrinsic_value
+        else:
+            # Use the regular close price
+            close_price = self.get_close_price(row_close, position["trade_side"])
 
-        self._log_daily_pnl(row, status="close", fees_incurred=total_fees_incurred)
-        self.open_position = None
+        # Calculate raw PnL
+        if position["trade_side"] == "sell":
+            # For short positions, profit = open price - close price
+            raw_pnl = (position["pos_value"] - close_price) * self.contract_size * 100
+        else:
+            # For long positions, profit = close price - open price
+            raw_pnl = (close_price - position["pos_value"]) * self.contract_size * 100
 
-    def _log_daily_pnl(self, row, status="hold", fees_incurred=0.0):
-        """Log daily PnL for the position, including fees incurred and precise percentages."""
-        if not self.open_position:
-            return
+        # Subtract fees (add closing fee to previously incurred opening fee)
+        position["fees_incurred"] += self.closing_fee
+        raw_pnl -= position["fees_incurred"]
 
-        is_expiration_day = (
-            row[self.columns["date_col"]].date() == self.open_position["expiration"].date()
-        )
+        # Log the "close" action with calculated PnL and intrinsic value
+        self._log_daily_pnl(position=position, row=row_close, status="close", raw_pnl=raw_pnl, close_price=close_price)
 
-        if is_expiration_day:
-            if self.open_position["call_put"] == "C":
-                pos_price = max(
-                    0, row[self.columns["underlying_price_col"]] - self.open_position["strike"]
-                )
-            elif self.open_position["call_put"] == "P":
-                pos_price = max(
-                    0, self.open_position["strike"] - row[self.columns["underlying_price_col"]]
-                )
-            pos_type = "intrinsic"
-        elif status == "open":
-            pos_price = self.get_open_price(row)
-            pos_type = "ask" if self.trade_side == "buy" else "bid"
-            fees_incurred = self.opening_fee
+        # Remove the position from open positions
+        self.open_positions.remove(position)
+
+    def close_all_positions(self, row):
+        """
+        Utility to close all open positions at once if desired.
+        (Sometimes you might just want to close them simultaneously.)
+        """
+        # Copy because we'll modify the list inside the loop
+        positions_copy = self.open_positions[:]
+        for pos in positions_copy:
+            self.close_position(pos, row)
+
+    def _log_daily_pnl(self, position, row, status="hold", raw_pnl=None, close_price=None):
+        """
+        Create a daily log entry for a given position on a given day.
+
+        If status == "open", apply opening fees.
+        If status == "close", do not apply additional fees here as they are handled in close_position.
+        If status == "hold", apply holding fees if any (currently no additional fees).
+        """
+        date_col = self.columns["date_col"]
+        c_date = row[date_col]
+        
+        # Determine the price for PnL logging
+        if status == "open":
+            pos_price = self.get_open_price(row, position["trade_side"])
+            # Fees are already applied in open_new_position
         elif status == "close":
-            pos_price = self.get_close_price(row)
-            pos_type = "mid"
-            fees_incurred = self.opening_fee + self.closing_fee
-        else:
+            pos_price = close_price if close_price is not None else self.get_close_price(row, position["trade_side"])
+            # Fees are already applied in close_position
+        else:  # "hold"
             pos_price = self.get_mid_price(row)
-            pos_type = "mid"
-            fees_incurred = 0.0
+            # Fees remain unchanged during holding
 
-        cumulative_fees = self.opening_fee
-        if status == "close":
-            cumulative_fees += self.closing_fee
+        # Compute raw PnL if not provided
+        if raw_pnl is None:
+            if position["trade_side"] == "buy":
+                raw_pnl = (pos_price - position["pos_value"]) * self.contract_size * 100
+            else:
+                raw_pnl = (position["pos_value"] - pos_price) * self.contract_size * 100
 
-        if self.trade_side == "buy":
-            total_raw_pnl = (pos_price - self.open_position["pos_value"]) * 100
-        else:
-            total_raw_pnl = (self.open_position["pos_value"] - pos_price) * 100
+        # Subtract cumulative fees from raw PnL only if status is not "close"
+        if status != "close":
+            raw_pnl -= position["fees_incurred"]
 
-        total_raw_pnl -= cumulative_fees
-        original_pnl = self.open_position["pos_value"] * 100
+        # Percentage PnL
+        cost_basis = position["pos_value"] * 100
+        total_pct_pnl = raw_pnl / cost_basis if cost_basis != 0 else np.nan
 
-        total_pct_pnl = (total_raw_pnl / original_pnl) if original_pnl != 0 else np.nan
-
+        # Create the log entry
         daily_record = {
-            "date": row[self.columns["date_col"]],
+            "date": c_date.strftime('%-m/%-d/%y'),
             "status": status,
-            "symbol": self.open_position["symbol"],
-            "side": "short" if self.trade_side == "sell" else "long",
-            "expiration": self.open_position["expiration"],
-            "strike": self.open_position["strike"],
+            "symbol": position["symbol"],
+            "side": "long" if position["trade_side"] == "buy" else "short",
+            "call_put": position["call_put"],
+            "expiration": position["expiration"].strftime('%-m/%-d/%y'),
+            "strike": position["strike"],
             "underlying_price": row.get(self.columns["underlying_price_col"], np.nan),
-            "pos_type": pos_type,
-            "pos_price": pos_price,
-            "quantity": self.open_position["quantity"],
+            "pos_price": round(pos_price, 3),
+            "quantity": position["quantity"],
             "openinterest": row.get(self.columns["openinterest_col"], np.nan),
             "iv": row.get(self.columns["iv_col"], np.nan),
-            "total_raw_pnl": round(total_raw_pnl, 8),
-            "total_pct_pnl": round(total_pct_pnl, 4),
+            "total_raw_pnl": round(raw_pnl, 6),
+            "total_pct_pnl": round(total_pct_pnl, 6),
         }
 
         self.daily_pnl_log.append(daily_record)
-        
-    # --------------------- Contract Selection --------------------- #
 
-    def pick_contract(self, df_for_day):
-        """Pick the option contract based on nearest expiration and closest-to-ATM."""
-        sub = df_for_day[df_for_day[self.columns["call_put_col"]] == self.call_or_put]
+    # ----------------------------------------------------------
+    # Contract Selection (example placeholders)
+    # ----------------------------------------------------------
+    
+    def pick_contract(self, df_for_day, call_put):
+        # Filter by call/put
+        sub = df_for_day[df_for_day[self.columns["call_put_col"]] == call_put]
+        
+        # Print or log what you have
+        print("---- Full sub for call_put=", call_put, "----")
+        print(sub[[self.columns["expiration_col"], self.columns["strike_col"]]].drop_duplicates())
 
         if self.monthly_expiration:
             sub = sub[sub[self.columns["expiration_col"]].apply(self._is_third_friday)]
+            print("---- After monthly filter ----")
+            print(sub[[self.columns["expiration_col"], self.columns["strike_col"]]].drop_duplicates())
+
+        # Filter only expirations after the current day
+        current_date = df_for_day[self.columns["date_col"]].iloc[0]
+        sub = sub[sub[self.columns["expiration_col"]] > current_date]
+        print("---- After expiration > current_date filter ----")
+        print(sub[[self.columns["expiration_col"], self.columns["strike_col"]]].drop_duplicates())
+
         if sub.empty:
             return None
 
-        if self.exclude_decimal_strikes:
-            sub = sub[sub[self.columns["strike_col"]] == sub[self.columns["strike_col"]].round()]
-        if sub.empty:
-            return None
-
-        sub["days_to_expiration"] = (sub[self.columns["expiration_col"]] - sub[self.columns["date_col"]]).dt.days
-        nearest_expiration = sub.loc[sub["days_to_expiration"].idxmin(), self.columns["expiration_col"]]
-
+        # Sort and pick the earliest expiration
+        sub = sub.sort_values(by=self.columns["expiration_col"], ascending=True)
+        nearest_expiration = sub.iloc[0][self.columns["expiration_col"]]
         sub = sub[sub[self.columns["expiration_col"]] == nearest_expiration]
+        
+        # Now pick closest to ATM
+        sub["distance_atm"] = abs(sub[self.columns["strike_col"]] - sub[self.columns["underlying_price_col"]])
+        row = sub.loc[sub["distance_atm"].idxmin()]
+        
+        return row
 
-        return sub.loc[sub[self.columns["otm_col"]].abs().idxmin()]
-
-    # --------------------- Main Backtest Loop --------------------- #
-
+    # ----------------------------------------------------------
+    # Main Backtest Loop (Corrected Logic)
+    # ----------------------------------------------------------
+    
     def run_backtest(self):
-        """Run the backtesting process."""
+        """Run the backtest, now capable of opening multiple positions at once."""
         csv_files = self._list_csv_files()
-        previous_expiration_date = None
-
         for file_path in csv_files:
             df = self._read_data(file_path)
             unique_dates = df[self.columns["date_col"]].dt.date.unique()
@@ -266,36 +351,48 @@ class RobustOptionBacktester:
                 current_date = pd.to_datetime(d)
                 day_name = current_date.day_name()
 
-                if previous_expiration_date is None:
-                    third_fridays = daily_df[self.columns["expiration_col"]].apply(self._is_third_friday)
-                    if third_fridays.any():
-                        previous_expiration_date = daily_df.loc[third_fridays.idxmax(), self.columns["expiration_col"]].date()
-                    continue
+                # 1) Identify positions to close (expiration date <= current date or adjusted expiration)
+                positions_to_close = []
+                for pos in self.open_positions:
+                    expiration_date = pos["expiration"].date()
+                    day_before_expiration = expiration_date - pd.Timedelta(days=1)
+                    
+                    # Check if the current date is expiration day or the adjusted expiration (Friday before)
+                    if d >= expiration_date or (d == day_before_expiration and day_before_expiration.weekday() == 4):
+                        positions_to_close.append(pos)
 
-                monday_after_expiration = previous_expiration_date + pd.Timedelta(days=(7 - previous_expiration_date.weekday()))
-                if current_date.date() < monday_after_expiration:
-                    if self.open_position:
-                        matching = daily_df[daily_df[self.columns["option_symbol_col"]] == self.open_position["symbol"]]
-                        if not matching.empty:
-                            self._log_daily_pnl(matching.iloc[0], status="hold")
-                    continue
+                # 2) Close identified positions using the last available underlying price before or on expiration
+                for pos in positions_to_close:
+                    # Find the last row on or before expiration date
+                    closing_rows = df[df[self.columns["date_col"]].dt.date <= pos["expiration"].date()]
+                    if not closing_rows.empty:
+                        row_close = closing_rows.iloc[-1]
+                        self.close_position(pos, row_close)
+                    else:
+                        # If no data on or before expiration, use current day's underlying price
+                        row_close = daily_df.iloc[-1]
+                        self.close_position(pos, row_close)
 
-                if self.open_position and d >= self.open_position["expiration"].date():
-                    previous_expiration_date = self.open_position["expiration"].date()
-                    row_close = daily_df.iloc[-1]
-                    self.close_position(row_close)
-                    continue
+                # 3) Update daily PnL for all remaining open positions as "hold"
+                for pos in self.open_positions:
+                    matching = daily_df[daily_df[self.columns["option_symbol_col"]] == pos["symbol"]]
+                    if not matching.empty:
+                        row = matching.iloc[0]
+                        self._log_daily_pnl(position=pos, row=row, status="hold")
 
-                if self.open_position is None and day_name == self.day_of_entry:
-                    candidate = self.pick_contract(daily_df)
-                    if candidate is not None:
-                        self.open_new_position(candidate)
-                else:
-                    if self.open_position:
-                        matching = daily_df[daily_df[self.columns["option_symbol_col"]] == self.open_position["symbol"]]
-                        if not matching.empty:
-                            self._log_daily_pnl(matching.iloc[0], status="hold")
+                # 4) If it's the day_of_entry and no open positions, open new positions
+                if day_name == self.day_of_entry and len(self.open_positions) == 0:
+                    # For instance, open a 2-leg strangle: short call + short put.
+                    row_call = self.pick_contract(daily_df, call_put="C")
+                    row_put  = self.pick_contract(daily_df, call_put="P")
+                    if (row_call is not None) and (row_put is not None):
+                        # Sell the call and sell the put simultaneously
+                        self.open_multiple_positions([
+                            (row_call, "sell"), 
+                            (row_put,  "sell")
+                        ])
 
+        # Convert daily log to DataFrame
         final_daily_df = pd.DataFrame(self.daily_pnl_log)
 
         # Save the daily PnL log
@@ -317,19 +414,18 @@ class RobustOptionBacktester:
 
         return final_daily_df
 
-
 # --------------------- Example Usage --------------------- #
 if __name__ == "__main__":
     symbol = "UVXY"
     backtester = RobustOptionBacktester(
         data_directory=f"historical/{symbol}/",
-        start_date="2014-01-01",
-        end_date="2024-12-31",
-        call_or_put="P",
-        trade_side="sell",
+        start_date="2011-01-01",
+        end_date="2018-12-31",
+        day_of_entry="Monday",
         monthly_expiration=True,
         exclude_decimal_strikes=True,
         daily_pnl_output_csv=f"trade_logs/{symbol}_daily_pnl_log.csv",
         closed_positions_output_csv=f"trade_logs/{symbol}_closed_positions_log.csv",
     )
     daily_df = backtester.run_backtest()
+    print(daily_df)
